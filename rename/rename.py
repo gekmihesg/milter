@@ -16,34 +16,28 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
-# v0.1 - markus@gekmihesg.de
+# v0.2 - 2014-05-16 - markus@gekmihesg.de
+#   * RenameConfig class
+#
+# v0.1 - 2014-05-14 - markus@gekmihesg.de
 #
 
 import sys
 import os
+import re
 import Milter
 from syslog import *
-from re import compile
 from ConfigParser import RawConfigParser as ConfigParser
 from Milter.utils import parse_header
 
-cfg_defaults = {
-        'Socket': '/var/spool/postfix/milter/rename.sock',
-        'UMask': '002',
-        'Timeout': 600,
-        'Marker': 'Received',
-        'Prefix': 'X-Original-',
-        'LogFacility': 'mail',
-        'LogLevel': 'notice',
-    }
 
 milter_name = 'RenameMilter'
 syslog_name = 'rename-milter'
 config_file = '/etc/milter/rename.conf'
 
+
 class RenameHeader(object):
-    def __init__(self, name, pattern):
-        self.name = name
+    def __init__(self, pattern):
         self.pattern = pattern
         self.reset()
 
@@ -55,24 +49,25 @@ class RenameHeader(object):
         return not self.pattern or \
                 self.pattern.match(parse_header(value))
 
-    def add(self, value, pos):
+    def add(self, name, value, pos):
         self.count += 1
         if self.check(value):
-            self.occurences.append( (value, self.count, pos) )
+            self.occurences.append((name, value, self.count, pos))
             return True
         return False
+
 
 class RenameMilter(Milter.Base):
     def __init__(self, headers, marker, prefix):
         self.id = Milter.uniqueID()
         self.headers = {}
         for name, pattern in headers.iteritems():
-            self.headers[name.lower()] = RenameHeader(name, pattern)
-        self.marker = marker.lower()
+            self.headers[name] = RenameHeader(pattern)
+        self.marker = marker
         self.prefix = prefix
         self.message_count = 0
         self.reset()
-        self.log(LOG_DEBUG, "instance %d initialized", self.id)
+        self.log(LOG_DEBUG, 'instance %d initialized' %(self.id))
 
     def reset(self):
         self.header_count = 0
@@ -81,113 +76,118 @@ class RenameMilter(Milter.Base):
 
     @Milter.noreply
     def connect(self, hostname, *args, **kwargs):
-        self.log(LOG_INFO, "new connection from %s", hostname)
+        self.log(LOG_INFO, 'new connection from %s' %(hostname))
         return Milter.CONTINUE
 
     def header(self, name, value):
         self.header_count += 1
-        name = name.lower()
-        if name == self.marker and not self.received_pos:
+        nl = name.lower()
+        if nl == self.marker and not self.received_pos:
             self.received_pos = self.header_count
-            self.log(LOG_DEBUG, "marking position %d as start", self.header_count)
-        elif self.headers.has_key(name):
-            if self.headers[name].add(value, self.header_count):
-                self.log(LOG_DEBUG, "matching %s at position %d", name, self.header_count)
+            self.log(LOG_DEBUG, 'marking position %d as start' %(self.header_count))
+        elif self.headers.has_key(nl):
+            if self.headers[nl].add(name, value, self.header_count):
+                self.log(LOG_DEBUG, 'matching %s at position %d' %(nl, self.header_count))
             else:
-                self.log(LOG_DEBUG, "non-matching %s at postition %d", name, self.header_count)
+                self.log(LOG_DEBUG, 'not matching %s at postition %d' %(nl, self.header_count))
         return Milter.CONTINUE
 
     def eom(self):
-        for hdr in self.headers.itervalues():
-            newname = self.prefix + hdr.name
+        for nl, hdr in self.headers.iteritems():
             deleted = 0
-            for value, idx, pos in hdr.occurences:
+            for name, value, idx, pos in hdr.occurences:
                 if pos > self.received_pos:
-                    self.addheader(newname, value, pos + 1)
-                    self.chgheader(hdr.name, idx - deleted, None)
+                    self.addheader(self.prefix + name, value, pos + 1)
+                    self.chgheader(name, idx - deleted, None)
                     deleted += 1
-                    self.log(LOG_DEBUG, "renamed %s at position %d", hdr.name, pos)
-            self.log(LOG_INFO, "renamed %d %s to %s", deleted, hdr.name, newname)
+                    self.log(LOG_DEBUG, 'renaming %s at position %d' %(nl, pos))
+            self.log(LOG_NOTICE if deleted else LOG_INFO,
+                    'renamed %d %s headers in message %d' %(deleted, nl, self.message_count))
             hdr.reset()
-        self.log(LOG_INFO, "end of message %d", self.message_count)
+        self.log(LOG_INFO, 'end of message %d' %(self.message_count))
         self.reset()
         return Milter.CONTINUE
 
     def close(self):
-        self.log(LOG_INFO, "disconnected")
+        self.log(LOG_INFO, 'disconnected after %d message(s)' %(self.message_count - 1))
         return Milter.CONTINUE
 
-    def log(self, prio, msg, *args):
-        syslog(prio, '%d: %s' %(self.id, msg %args))
+    def log(self, prio, msg):
+        syslog(prio, '%d: %s' %(self.id, msg))
 
 
-facility_map = {
-        'kern': LOG_KERN,
-        'user': LOG_USER,
-        'mail': LOG_MAIL,
-        'daemon': LOG_DAEMON,
-        'auth': LOG_AUTH,
-        'lpr': LOG_LPR,
-        'news': LOG_NEWS,
-        'uucp': LOG_UUCP,
-        'cron': LOG_CRON,
-        'syslog': LOG_SYSLOG,
-        'local0': LOG_LOCAL0,
-        'local1': LOG_LOCAL1,
-        'local2': LOG_LOCAL2,
-        'local3': LOG_LOCAL3,
-        'local4': LOG_LOCAL4,
-        'local5': LOG_LOCAL5,
-        'local6': LOG_LOCAL6,
-        'local7': LOG_LOCAL7,
-    }
+class RenameConfig(object):
+    cfg_map = {
+            'logfacility': { 'kern': LOG_KERN, 'user': LOG_USER, 'mail': LOG_MAIL,
+                    'daemon': LOG_DAEMON, 'auth': LOG_AUTH, 'lpr': LOG_LPR, 'news': LOG_NEWS,
+                    'uucp': LOG_UUCP, 'cron': LOG_CRON, 'syslog': LOG_SYSLOG, 
+                    'local0': LOG_LOCAL0, 'local1': LOG_LOCAL1, 'local2': LOG_LOCAL2,
+                    'local3': LOG_LOCAL3, 'local4': LOG_LOCAL4, 'local5': LOG_LOCAL5,
+                    'local6': LOG_LOCAL6, 'local7': LOG_LOCAL7,
+                },
+            'loglevel': { 'emerg': LOG_EMERG, 'alert': LOG_ALERT, 'crit': LOG_CRIT,
+                    'err': LOG_ERR, 'warning': LOG_WARNING, 'notice': LOG_NOTICE,
+                    'info': LOG_INFO, 'debug': LOG_DEBUG,
+                },
+        }
 
-priority_map = {
-        'emerg': LOG_EMERG,
-        'alert': LOG_ALERT,
-        'crit': LOG_CRIT,
-        'err': LOG_ERR,
-        'warning': LOG_WARNING,
-        'notice': LOG_NOTICE,
-        'info': LOG_INFO,
-        'debug': LOG_DEBUG,
-    }
+    def __init__(self, filename, section):
+        assert os.path.exists(filename), 'file not found'
+        self.filename = filename
+        self.cfg = {
+                'socket': '/var/spool/postfix/milter/rename.sock',
+                'umask': '002',
+                'timeout': 600,
+                'marker': 'Received',
+                'prefix': 'X-Original-',
+                'logfacility': LOG_MAIL,
+                'loglevel': LOG_NOTICE,
+            }
+        cfg = ConfigParser(allow_no_value=True)
+        cfg.read(self.filename)
+        for key in self.cfg.iterkeys():
+            if not cfg.has_option(section, key): continue
+            if self.cfg_map.has_key(key):
+                self.cfg[key] = self.cfg_map[key][cfg.get(section, key)]
+            elif isinstance(self.cfg[key], int):
+                self.cfg[key] = cfg.getint(section, key)
+            elif isinstance(self.cfg[key], bool):
+                self.cfg[key] = cfg.getboolean(section, key)
+            else:
+                self.cfg[key] = cfg.get(section, key)
+        self.rules = {}
+        for header, pattern in cfg.items('Rules'):
+            self.rules[header] = None if pattern is None \
+                    else re.compile(pattern, re.I)
+        assert len(self.rules), 'no rules defined'
+
+    def __getattr__(self, name):
+        return self.cfg[name]
 
 
-def main():
-    cfg = ConfigParser(allow_no_value=True)
-    cfg.optionxform = str
-    cfg.read(sys.argv[1] if len(sys.argv) > 1 else config_file)
+def main(argv):
+    try:
+        cfg = RenameConfig(argv[1] if len(argv) > 1 else config_file,
+                milter_name)
+    except Exception as e:
+        print >> sys.stderr, 'cannot parse config file:', str(e)
+        return 1
 
-    if not cfg.has_section('Rules'):
-        print >> sys.stderr, "no rules defined"
-        sys.exit(1)
+    openlog(syslog_name, LOG_PID, cfg.logfacility)
+    setlogmask(LOG_UPTO(cfg.loglevel))
+    syslog(LOG_NOTICE, 'starting with config %s' %(cfg.filename))
 
-    rules = {}
-    for header, pattern in cfg.items('Rules'):
-        rules[header] = None if pattern is None else compile(pattern)
-    get_cfg = lambda x: cfg.get(milter_name, x) \
-            if cfg.has_option(milter_name, x) else cfg_defaults[x]
-
-    openlog(syslog_name, LOG_PID, facility_map[get_cfg('LogFacility')])
-    setlogmask(LOG_UPTO(priority_map[get_cfg('LogLevel')]))
-    syslog(LOG_NOTICE, 'starting')
-
-    os.umask(int(get_cfg('UMask'), 8))
-    Milter.factory = lambda: RenameMilter(rules,
-            get_cfg('Marker'),
-            get_cfg('Prefix')
-        )
+    os.umask(int(cfg.umask, 8))
+    Milter.factory = lambda: RenameMilter(cfg.rules,
+            cfg.marker.lower(), cfg.prefix)
     Milter.set_flags(Milter.CHGHDRS + Milter.ADDHDRS)
-    Milter.runmilter(milter_name,
-            get_cfg('Socket'),
-            get_cfg('Timeout')
-        )
+    Milter.runmilter(milter_name, cfg.socket, cfg.timeout)
 
     syslog(LOG_NOTICE, 'end')
     closelog()
+    return 0
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
 
